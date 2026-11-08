@@ -77,6 +77,8 @@ select.chip option{color:#000}
 .grid button{text-align:left;padding:12px 14px;border-radius:12px;background:rgba(255,255,255,.06);border:1px solid var(--line)}
 @media(max-width:960px){.app{grid-template-columns:1fr}.side,.spaces{display:none}.mbar{display:flex}}
 @media(prefers-reduced-motion:no-preference){.dots{animation:p 1s infinite alternate}@keyframes p{to{opacity:.3}}}
+body::before{content:"";position:fixed;left:50%;top:18%;width:92vmin;height:92vmin;transform:translateX(-50%);border-radius:50%;border:2px solid rgba(167,139,250,.3);box-shadow:0 0 90px rgba(139,92,246,.35),inset 0 0 120px rgba(139,92,246,.12);pointer-events:none;z-index:-1}
+body::after{content:"";position:fixed;left:0;right:0;bottom:0;height:35vh;background:linear-gradient(transparent,rgba(124,58,237,.28));pointer-events:none;z-index:-1}
 </style>
 </head>
 <body>
@@ -118,7 +120,6 @@ select.chip option{color:#000}
       <textarea id="input" rows="1" placeholder="Ask Horizon AI anything..." aria-label="Message"></textarea>
       <div class="row">
         <button class="chip" id="chipAtt">Attach</button>
-        <button class="chip" id="chipImg">Generate Image</button>
         <button class="chip" id="chipWeb">Search Web</button>
         <button class="chip" id="chipVoice">Voice</button>
         <button id="send" aria-label="Send">&#8593;</button>
@@ -147,10 +148,7 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const store = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { alert("Browser storage is full. Delete some chats in Library."); } };
-const GEM = "https://generativelanguage.googleapis.com/v1beta/openai", OAI = "https://api.openai.com/v1";
-let S = { name: NAME_DEFAULT, key: "", base: GEM, model: "gemini-flash-latest", imageModel: "gpt-image-1", temp: 0.7, ...load("hz_s", {}) };
-const isOAI = () => /api\.openai\.com/.test(S.base);
-const api = (p) => S.base.replace(/\/+$/, "") + p;
+let S = { name: NAME_DEFAULT, key: "", model: "gemini-flash-latest", temp: 0.7, ...load("hz_s", {}) };
 const errMsg = (j, d) => (Array.isArray(j) ? j[0] : j)?.error?.message || d;
 let chats = load("hz_c", []), cur, space = "General Chat", att = [], imgMode = false, webMode = false, ctrl = null, busy = false;
 
@@ -158,7 +156,6 @@ const textOf = (c) => typeof c === "string" ? c : c.filter((p) => p.type === "te
 const imgsOf = (c) => Array.isArray(c) ? c.filter((p) => p.type === "image_url").map((p) => p.image_url.url) : [];
 const strip = (m) => ({ role: m.role, content: m.img ? "[generated image]" : Array.isArray(m.content) ? textOf(m.content) : m.content,
   show: (m.show ?? (m.img ? "" : textOf(m.content))) + (imgsOf(m.content).length ? "\n[image attached]" : "") });
-const hdr = () => ({ "Content-Type": "application/json", Authorization: "Bearer " + S.key });
 const scrollEnd = () => { $("#scroll").scrollTop = $("#scroll").scrollHeight; };
 
 function md(t) {
@@ -194,15 +191,11 @@ function openChat(c) {
   cur.msgs.forEach(draw); closeSheet();
 }
 
-async function genImage(prompt) {
-  const body = { model: S.imageModel, prompt, size: "1024x1024", n: 1 };
-  if (/^dall-e/.test(S.imageModel)) body.response_format = "b64_json";
-  const r = await fetch(api("/images/generations"), { method: "POST", headers: hdr(), body: JSON.stringify(body), signal: ctrl.signal });
-  const j = await r.json();
-  if (!r.ok) throw new Error(errMsg(j, "Image request failed."));
-  const d = j.data[0];
-  return d.b64_json ? "data:image/png;base64," + d.b64_json : d.url;
-}
+const toParts = (c) => typeof c === "string" ? [{ text: c }] : c.map((p) => {
+  if (p.type === "text") return { text: p.text };
+  const m = /^data:(.+?);base64,(.+)$/.exec(p.image_url.url);
+  return { inlineData: { mimeType: m[1], data: m[2] } };
+});
 
 async function send() {
   if (busy) { ctrl.abort(); return; }
@@ -222,30 +215,27 @@ async function send() {
   busy = true; ctrl = new AbortController(); $("#send").innerHTML = "&#9632;";
   let acc = "";
   try {
-    if (imgMode) {
-      const m = { role: "assistant", content: "", img: await genImage(text) };
-      cur.msgs.push(m); fill(el, m); el.classList.remove("dots"); setImg(false);
-    } else {
-      const body = { model: webMode ? "gpt-4o-search-preview" : S.model, stream: true,
-        messages: [{ role: "system", content: SPACES[space] }, ...cur.msgs.filter((m) => !m.img).map((m) => ({ role: m.role, content: m.content }))] };
-      if (webMode) body.web_search_options = {}; else if (!/^(o\d|gpt-5)/.test(S.model)) body.temperature = +S.temp;
-      const r = await fetch(api("/chat/completions"), { method: "POST", headers: hdr(), body: JSON.stringify(body), signal: ctrl.signal });
-      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(errMsg(j, "Request failed (" + r.status + ").")); }
-      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
-      el.classList.remove("dots");
-      for (;;) {
-        const { done, value } = await rd.read(); if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split("\n"); buf = lines.pop();
-        for (const l of lines) {
-          if (!l.startsWith("data: ")) continue;
-          const p = l.slice(6).trim(); if (p === "[DONE]") continue;
-          try { acc += JSON.parse(p).choices?.[0]?.delta?.content || ""; } catch {}
-        }
-        el.innerHTML = md(acc); scrollEnd();
+    const body = { systemInstruction: { parts: [{ text: SPACES[space] }] },
+      contents: cur.msgs.map((m) => ({ role: m.role === "user" ? "user" : "model", parts: toParts(m.content) })),
+      generationConfig: { temperature: +S.temp } };
+    if (webMode) body.tools = [{ google_search: {} }];
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(S.model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(S.key)}`;
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(errMsg(j, "Request failed (" + r.status + ").")); }
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    el.classList.remove("dots");
+    for (;;) {
+      const { done, value } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const l of lines) {
+        if (!l.startsWith("data: ")) continue;
+        try { acc += (JSON.parse(l.slice(6)).candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join(""); } catch {}
       }
-      cur.msgs.push({ role: "assistant", content: acc });
+      el.innerHTML = md(acc); scrollEnd();
     }
+    if (!acc) throw new Error("Gemini returned no text. Try rephrasing your message.");
+    cur.msgs.push({ role: "assistant", content: acc });
   } catch (e) {
     if (e.name === "AbortError") { if (acc) cur.msgs.push({ role: "assistant", content: acc }); else { el.remove(); cur.msgs.pop(); } }
     else { el.className = "msg err"; el.textContent = e.message; cur.msgs.pop(); $("#input").value = text; }
@@ -256,7 +246,6 @@ async function send() {
 function showAtt() {
   $("#att").innerHTML = att.map((a, i) => `<button class="chip" data-rm="${i}">${esc(a.name)} &#10005;</button>`).join("");
 }
-function setImg(v) { if (v && !isOAI()) { alert("Image generation only works with an OpenAI key."); return; } imgMode = v; $("#chipImg").classList.toggle("on", v); $("#input").placeholder = v ? "Describe the image to generate..." : "Ask Horizon AI anything..."; }
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition; let rec = null;
 function voice() {
   if (!SR) { alert("Voice input is not supported in this browser."); return; }
@@ -283,22 +272,18 @@ function act(a) {
   if (a === "library") return sheet("Library", list());
   if (a === "search") { sheet("Search chats", '<input id="q" placeholder="Search your chats..." autocomplete="off"><div id="res">' + list() + "</div>"); $("#q").oninput = (e) => { $("#res").innerHTML = list(e.target.value); }; return $("#q").focus(); }
   if (a === "explore") return sheet("Explore", '<div class="grid">' + EXPLORE.map((p) => `<button data-p="${esc(p)}">${esc(p)}</button>`).join("") + "</div>");
-  if (a === "tools") return sheet("Tools", '<div class="grid"><button data-t="img">Generate an image</button><button data-t="attach">Attach an image or file</button><button data-t="voice">Dictate with your voice</button><button data-t="export">Export this chat (.md)</button><button data-t="clear">Delete all saved chats</button></div>');
+  if (a === "tools") return sheet("Tools", '<div class="grid"><button data-t="attach">Attach an image or file</button><button data-t="voice">Dictate with your voice</button><button data-t="export">Export this chat (.md)</button><button data-t="clear">Delete all saved chats</button></div>');
   if (a === "settings") {
     sheet("Settings", `<label>Your name<input id="f_name" value="${esc(S.name)}"></label>
-<label>Provider<select id="f_prov" class="chip"><option value="g"${S.base === GEM ? " selected" : ""}>Google Gemini</option><option value="o"${isOAI() ? " selected" : ""}>OpenAI</option><option value="c"${S.base !== GEM && !isOAI() ? " selected" : ""}>Custom</option></select></label>
-<label>API key<input id="f_key" type="password" value="${esc(S.key)}" placeholder="Paste your key" autocomplete="off"></label>
-<p class="note">Saved only in this browser. It is never put in the code and only goes to the provider you pick.</p>
-<label>Base URL<input id="f_base" value="${esc(S.base)}"></label>
-<label>Chat model<input id="f_model" list="ml" value="${esc(S.model)}"></label>
-<datalist id="ml"><option>gemini-flash-latest<option>gemini-2.5-flash<option>gemini-2.5-flash-lite<option>gpt-4o-mini<option>gpt-4o<option>gpt-4.1-mini</datalist>
-<label>Image model (OpenAI only)<input id="f_img" value="${esc(S.imageModel)}"></label>
+<label>Gemini API key<input id="f_key" type="password" value="${esc(S.key)}" placeholder="Paste your key (starts with AIza)" autocomplete="off"></label>
+<p class="note">Saved only in this browser and sent only to Google. Get a free key at aistudio.google.com/apikey</p>
+<label>Model<input id="f_model" list="ml" value="${esc(S.model)}"></label>
+<datalist id="ml"><option>gemini-flash-latest<option>gemini-2.5-flash<option>gemini-2.5-flash-lite<option>gemini-2.5-pro</datalist>
 <label>Creativity: <span id="tv">${S.temp}</span><input id="f_temp" type="range" min="0" max="1.5" step="0.1" value="${S.temp}"></label>
 <button class="chip on" id="saveS">Save settings</button>`);
-    $("#f_prov").onchange = (e) => { const v = e.target.value; if (v === "g") { $("#f_base").value = GEM; $("#f_model").value = "gemini-flash-latest"; } if (v === "o") { $("#f_base").value = OAI; $("#f_model").value = "gpt-4o-mini"; } };
     $("#f_temp").oninput = (e) => { $("#tv").textContent = e.target.value; };
     $("#saveS").onclick = () => {
-      S = { ...S, name: $("#f_name").value.trim() || NAME_DEFAULT, key: $("#f_key").value.trim(), base: $("#f_base").value.trim() || GEM, model: $("#f_model").value.trim() || "gemini-flash-latest", imageModel: $("#f_img").value.trim() || "gpt-image-1", temp: +$("#f_temp").value };
+      S = { ...S, name: $("#f_name").value.trim() || NAME_DEFAULT, key: $("#f_key").value.trim(), model: $("#f_model").value.trim() || "gemini-flash-latest", temp: +$("#f_temp").value };
       store("hz_s", S); head(); closeSheet();
     };
   }
@@ -329,7 +314,7 @@ $("#sheetB").onclick = (e) => {
     const t = b.dataset.t;
     if (t === "clear") { if (confirm("Delete all saved chats?")) { chats = []; store("hz_c", chats); } closeSheet(); return; }
     closeSheet();
-    if (t === "img") setImg(true); else if (t === "attach") $("#file").click(); else if (t === "voice") voice(); else if (t === "export") exportChat();
+    if (t === "attach") $("#file").click(); else if (t === "voice") voice(); else if (t === "export") exportChat();
   }
 };
 $("#spaceSel").onchange = (e) => { space = e.target.value; renderSpaces(); newChat(); };
@@ -337,8 +322,7 @@ $("#sheetX").onclick = closeSheet;
 $("#sheetBg").onclick = (e) => { if (e.target.id === "sheetBg") closeSheet(); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSheet(); });
 $("#chipAtt").onclick = () => $("#file").click();
-$("#chipImg").onclick = () => setImg(!imgMode);
-$("#chipWeb").onclick = () => { if (!webMode && !isOAI()) { alert("Web search only works with an OpenAI key."); return; } webMode = !webMode; $("#chipWeb").classList.toggle("on", webMode); };
+$("#chipWeb").onclick = () => { webMode = !webMode; $("#chipWeb").classList.toggle("on", webMode); };
 $("#chipVoice").onclick = voice;
 $("#file").onchange = async (e) => {
   for (const f of e.target.files) {
